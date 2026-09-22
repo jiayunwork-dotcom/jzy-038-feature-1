@@ -148,4 +148,70 @@ assert(bulk.status === 200 && bulk.json.count === 2
   && bulk.json.records[0].status === 'ok' && bulk.json.records[1].status === 'rejected',
   '批量提交：合法与非法记录各自独立留存');
 
+// 10) 批次级相序标定
+const sample = original;
+
+// 10.1 forward/0 与 reverse/0：正、负序正好互换，零序相同
+const bFwd = (await call('POST', '/batches', { calibration: { direction: 'forward', referenceOffsetDeg: 0 } })).json;
+const bRev = (await call('POST', '/batches', { calibration: { direction: 'reverse', referenceOffsetDeg: 0 } })).json;
+assert(bFwd.calibration.direction === 'forward' && bFwd.calibration.referenceOffsetDeg === 0, '批次响应带冻结标定');
+const sFwd = (await call('POST', `/batches/${bFwd.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sample,
+})).json.result.sequence;
+const sRev = (await call('POST', `/batches/${bRev.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sample,
+})).json.result.sequence;
+assert(close(sRev.positive.magnitude, sFwd.negative.magnitude, 1e-8)
+  && close(sRev.negative.magnitude, sFwd.positive.magnitude, 1e-8)
+  && close(sRev.zero.magnitude, sFwd.zero.magnitude, 1e-8),
+  '反向标定：正/负序互换，零序不变');
+
+// 10.2 非零偏移：同一批次先正后反精确还原
+const bShift = (await call('POST', '/batches', { calibration: { direction: 'reverse', referenceOffsetDeg: 83.7 } })).json;
+const shFwd = (await call('POST', `/batches/${bShift.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sample,
+})).json;
+const shBack = (await call('POST', `/batches/${bShift.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'sequence->phase', sequence: shFwd.result.sequence,
+})).json.result.phases;
+let shiftRoundtrip = true;
+for (const k of ['a', 'b', 'c']) {
+  shiftRoundtrip &&= close(shBack[k].magnitude, sample[k].magnitude, 1e-8);
+  shiftRoundtrip &&= close(shBack[k].angleDeg, sample[k].angleDeg, 1e-7);
+}
+assert(shiftRoundtrip, 'reverse + 83.7° 偏移：正反变换精确还原原始三相');
+assert(shFwd.calibration.direction === 'reverse' && shFwd.calibration.referenceOffsetDeg === 83.7,
+  '记录留痕可辨认当批标定');
+
+// 10.3 故障核算在带标定批次里：序电压反变换重建出故障相电压
+const shFault = (await call('POST', `/batches/${bShift.id}/records`, {
+  kind: 'fault',
+  z1: { magnitude: 1, angleDeg: 80 }, z2: { magnitude: 1.2, angleDeg: 78 },
+  z0: { magnitude: 2, angleDeg: 75 }, vf: { magnitude: 1, angleDeg: 18 }, rf: 0.1,
+})).json.result;
+const rebuilt = (await call('POST', `/batches/${bShift.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'sequence->phase', sequence: shFault.sequenceVoltages,
+})).json.result.phases;
+assert(close(rebuilt.a.magnitude, shFault.faultedPhaseVoltage.magnitude, 1e-7)
+  && close(rebuilt.a.angleDeg, shFault.faultedPhaseVoltage.angleDeg, 1e-6),
+  '故障模块与变换模块走同一套标定：序电压反变换重建故障相电压');
+
+// 10.4 非法偏移开立被结构化拒绝，且不产生批次
+const badOffset = await call('POST', '/batches', { calibration: { referenceOffsetDeg: Number.POSITIVE_INFINITY } });
+assert(badOffset.status === 400 && badOffset.json.error.code === 'CALIBRATION_OFFSET_NOT_FINITE',
+  '非有限偏移：开立阶段 400 结构化拒绝');
+const badDir = await call('POST', '/batches', { calibration: { direction: 'sideways' } });
+assert(badDir.status === 400 && badDir.json.error.code === 'CALIBRATION_DIRECTION_INVALID',
+  '非法方向：开立阶段 400 结构化拒绝');
+
+// 10.5 已开立批次修改标定：409 拒绝
+const freeze = await call('PATCH', `/batches/${bShift.id}`, { calibration: { direction: 'forward', referenceOffsetDeg: 0 } });
+assert(freeze.status === 409 && freeze.json.error.code === 'BATCH_CALIBRATION_FROZEN',
+  '冻结标定不可变更：409 BATCH_CALIBRATION_FROZEN');
+const stillFrozen = (await call('GET', `/batches/${bShift.id}`)).json;
+assert(stillFrozen.calibration.direction === 'reverse' && stillFrozen.calibration.referenceOffsetDeg === 83.7,
+  '拒绝变更后批次标定保持原值');
+const noteOk = await call('PATCH', `/batches/${bShift.id}`, { note: 'note still editable' });
+assert(noteOk.status === 200 && noteOk.json.note === 'note still editable', '备注仍可修改（仅标定冻结）');
+
 console.log(process.exitCode ? '\nSMOKE FAILED' : '\nALL SMOKE CHECKS PASSED');

@@ -3,6 +3,23 @@ import type { Complex } from './complex.js';
 /** 换算量类型：电压或电流，二者共用同一套对称分量定义与同一个旋转算子 */
 export type QuantityType = 'voltage' | 'current';
 
+/**
+ * 相序标定方向：
+ * - forward：服务默认约定（A 相基准，B 滞后 120°，C 超前 120°，旋转因子取 +120°）
+ * - reverse：现场反向标定，调用方表述中的正/负序与默认约定对调（等价于 B、C 互换角色）
+ */
+export type SequenceDirection = 'forward' | 'reverse';
+
+/**
+ * 批次级相序标定（开立时指定、开立后冻结）。
+ * referenceOffsetDeg：这批数据的零度参考点相对服务默认零度参考点转过的角度（度）。
+ * 输入先进服务参考系（相角减去该偏移）再进数学核心，输出再加回该偏移回到调用方参考系。
+ */
+export interface Calibration {
+  readonly direction: SequenceDirection;
+  readonly referenceOffsetDeg: number;
+}
+
 /** 变换方向：phase->sequence 为正变换，sequence->phase 为反变换 */
 export type TransformDirection = 'phase->sequence' | 'sequence->phase';
 
@@ -64,10 +81,6 @@ export interface FaultRecordInput {
 
 export type RecordInput = ForwardRecordInput | InverseRecordInput | FaultRecordInput;
 
-export interface CreateBatchInput {
-  note?: string;
-}
-
 /** 非法输入的单条字段错误 */
 export interface FieldError {
   code: ErrorCode;
@@ -85,6 +98,11 @@ export type ErrorCode =
   | 'LINE_ZERO_SEQUENCE_NOT_ZERO'
   | 'LINE_MODE_NOT_APPLICABLE_TO_CURRENT'
   | 'MALFORMED_PHASOR'
+  | 'CALIBRATION_INVALID'
+  | 'CALIBRATION_OFFSET_NOT_FINITE'
+  | 'CALIBRATION_DIRECTION_INVALID'
+  | 'CALIBRATION_MALFORMED'
+  | 'BATCH_CALIBRATION_FROZEN'
   | 'BATCH_NOT_FOUND'
   | 'RECORD_NOT_FOUND'
   | 'UNSUPPORTED_RECORD';
@@ -127,6 +145,8 @@ export interface Batch {
   id: string;
   createdAt: string;
   note: string | null;
+  /** 开立时冻结的标定快照；批次存续期间所有记录都使用这一套，不受服务默认标定变化影响 */
+  calibration: Calibration;
 }
 
 export interface StoredRecord {
@@ -138,6 +158,8 @@ export interface StoredRecord {
   input: RecordInput;
   result: RecordResultPayload | null;
   errors: FieldError[];
+  /** 本条记录实际使用的标定（= 批次冻结标定的快照），事后回看任意记录都可辨认口径 */
+  calibration: Calibration;
 }
 
 /** 复数内部表示（实部/虚部），供内核模块使用 */

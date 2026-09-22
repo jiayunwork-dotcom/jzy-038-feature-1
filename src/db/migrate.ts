@@ -21,6 +21,19 @@ CREATE TABLE IF NOT EXISTS records (
   UNIQUE (batch_id, idx)
 );
 
+-- 标定能力上线：批次开立时冻结相序方向与基准偏移。
+-- 旧行由列 DEFAULT 兜底为 'forward' / 0 —— 正是旧服务唯一支持的默认标定，
+-- 因此升级前后旧批次的计算语义完全等价，不存在"标定不明"的孤儿数据。
+ALTER TABLE batches
+  ADD COLUMN IF NOT EXISTS direction TEXT NOT NULL DEFAULT 'forward'
+    CHECK (direction IN ('forward', 'reverse')),
+  ADD COLUMN IF NOT EXISTS reference_offset_deg DOUBLE PRECISION NOT NULL DEFAULT 0;
+
+-- 每条记录留存当时使用的标定快照（JSONB），事后回看任意记录即可辨认口径。
+-- 旧行先置 NULL，读取侧 resolveStoredCalibration 按批次列/默认标定宽容认定。
+ALTER TABLE records
+  ADD COLUMN IF NOT EXISTS calibration JSONB;
+
 CREATE INDEX IF NOT EXISTS idx_records_batch ON records (batch_id, idx);
 `;
 
@@ -30,7 +43,7 @@ export async function runMigrations(connectionString: string = config.databaseUr
   try {
     await client.query(SCHEMA_DDL);
   } finally {
-    await client.end();
+    client.end();
   }
 }
 

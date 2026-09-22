@@ -5,6 +5,7 @@
 
 import { Complex } from './complex.js';
 import type {
+  Calibration,
   FaultRecordInput,
   FieldError,
   ForwardRecordInput,
@@ -12,7 +13,7 @@ import type {
   PhasorDTO,
   RecordInput,
 } from './types.js';
-import { phasesToSequence } from './kernel/transform.js';
+import { CalibratedEngine, DEFAULT_CALIBRATION } from './calibration.js';
 
 /** 线量零序允许的最大幅值（相对值，相对该组最大幅值） */
 const LINE_ZERO_SEQUENCE_TOLERANCE = 1e-9;
@@ -166,20 +167,22 @@ export function validateRecordShape(raw: unknown): { ok: true; input: RecordInpu
   return { ok: true, input: raw as unknown as RecordInput };
 }
 
-/** 完整字段校验（结构校验通过后调用） */
-export function validateRecord(input: RecordInput): FieldError[] {
+/** 完整字段校验（结构校验通过后调用）。线量零序检查走当批标定引擎，与正式计算同一套口径。 */
+export function validateRecord(input: RecordInput, calibration: Calibration = DEFAULT_CALIBRATION): FieldError[] {
   if (input.kind === 'fault') return validateFault(input);
   if (input.direction === 'phase->sequence') {
     const errors = validateForward(input);
-    // 线电压正变换：变换结果中的零序必须为零（浮点容差）
+    // 线电压正变换：变换结果中的零序必须为零（浮点容差）。
+    // 零序不含方向/角度标定的分歧，但仍必须经由当批标定引擎计算，杜绝另写一份口径。
     if (input.phaseMode === 'line' && errors.length === 0) {
-      const c = toComplex(input.phases.a);
-      const maxMag = Math.max(c.magnitude, toComplex(input.phases.b).magnitude, toComplex(input.phases.c).magnitude);
-      const zero = phasesToSequence({
-        a: c,
+      const engine = new CalibratedEngine(calibration);
+      const phases = {
+        a: toComplex(input.phases.a),
         b: toComplex(input.phases.b),
         c: toComplex(input.phases.c),
-      }).zero;
+      };
+      const maxMag = Math.max(phases.a.magnitude, phases.b.magnitude, phases.c.magnitude);
+      const zero = engine.phasesToSequence(phases).zero;
       if (zero.magnitude > LINE_ZERO_SEQUENCE_TOLERANCE * Math.max(maxMag, 1)) {
         errors.push({
           code: 'LINE_ZERO_SEQUENCE_NOT_ZERO',

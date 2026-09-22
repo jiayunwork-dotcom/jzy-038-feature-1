@@ -1,13 +1,16 @@
 /**
- * 记录处理引擎：校验 -> 调用变换/故障内核 -> 组装可留存的记录。
+ * 记录处理引擎：校验 -> 标定归正 -> 调用变换/故障内核 -> 标定换回 -> 组装可留存的记录。
  * 校验不过的记录也原样留存（status=rejected + 结构化错误），不抛异常给调用方。
+ *
+ * 标定处理只有这一处下水：正变换、反变换、故障核算都使用由当批冻结标定构造的
+ * 同一个 CalibratedEngine，任何记录都不允许绕过它直连数学核心。
  */
 
 import { Complex } from './complex.js';
-import { phasesToSequence, sequenceToPhases } from './kernel/transform.js';
-import { calculateSlgFault } from './kernel/fault.js';
+import { CalibratedEngine, DEFAULT_CALIBRATION } from './calibration.js';
 import { validateRecord, validateRecordShape } from './validation.js';
 import type {
+  Calibration,
   FaultRecordInput,
   FaultResultPayload,
   ForwardRecordInput,
@@ -33,7 +36,10 @@ function sequenceDTO(s: { zero: Complex; positive: Complex; negative: Complex })
   return { zero: polarDTO(s.zero), positive: polarDTO(s.positive), negative: polarDTO(s.negative) };
 }
 
-function computeTransform(input: ForwardRecordInput | InverseRecordInput): TransformResultPayload {
+function computeTransform(
+  input: ForwardRecordInput | InverseRecordInput,
+  engine: CalibratedEngine,
+): TransformResultPayload {
   const phaseMode = input.phaseMode ?? 'phase';
   if (input.direction === 'phase->sequence') {
     const phasesC = {
@@ -41,7 +47,7 @@ function computeTransform(input: ForwardRecordInput | InverseRecordInput): Trans
       b: Complex.polar(input.phases.b.magnitude, input.phases.b.angleDeg),
       c: Complex.polar(input.phases.c.magnitude, input.phases.c.angleDeg),
     };
-    const seqC = phasesToSequence(phasesC);
+    const seqC = engine.phasesToSequence(phasesC);
     return {
       kind: 'transform',
       quantity: input.quantity,
@@ -56,7 +62,7 @@ function computeTransform(input: ForwardRecordInput | InverseRecordInput): Trans
     positive: Complex.polar(input.sequence.positive.magnitude, input.sequence.positive.angleDeg),
     negative: Complex.polar(input.sequence.negative.magnitude, input.sequence.negative.angleDeg),
   };
-  const phasesC = sequenceToPhases(seqC);
+  const phasesC = engine.sequenceToPhases(seqC);
   return {
     kind: 'transform',
     quantity: input.quantity,
@@ -67,8 +73,8 @@ function computeTransform(input: ForwardRecordInput | InverseRecordInput): Trans
   };
 }
 
-function computeFault(input: FaultRecordInput): FaultResultPayload {
-  const out = calculateSlgFault({
+function computeFault(input: FaultRecordInput, engine: CalibratedEngine): FaultResultPayload {
+  const out = engine.calculateFault({
     z1: Complex.polar(input.z1.magnitude, input.z1.angleDeg),
     z2: Complex.polar(input.z2.magnitude, input.z2.angleDeg),
     z0: Complex.polar(input.z0.magnitude, input.z0.angleDeg),
@@ -95,28 +101,36 @@ function computeFault(input: FaultRecordInput): FaultResultPayload {
 }
 
 /**
- * 处理一条原始记录：结构/字段校验 + 内核计算。
- * 返回可直接留存的 StoredRecord（不含 id/批次号，由持久化层补齐）。
+ * 处理一条原始记录：结构/字段校验 + 当批标定下的内核计算。
+ * 返回可直接留存的 StoredRecord（不含 id/批次号，由持久化层补齐），其中带当批标定快照。
  */
-export function processRecord(raw: unknown): Omit<StoredRecord, 'id' | 'batchId' | 'index' | 'createdAt'> {
+export function processRecord(
+  raw: unknown,
+  calibration: Calibration = DEFAULT_CALIBRATION,
+): Omit<StoredRecord, 'id' | 'batchId' | 'index' | 'createdAt'> {
   const shape = validateRecordShape(raw);
   if (!shape.ok) {
-    return { status: 'rejected', input: raw as RecordInput, result: null, errors: shape.errors };
+    return { status: 'rejected', input: raw as RecordInput, result: null, errors: shape.errors, calibration };
   }
   const input = shape.input;
-  const errors = validateRecord(input);
+  const errors = validateRecord(input, calibration);
   if (errors.length > 0) {
-    return { status: 'rejected', input, result: null, errors };
+    return { status: 'rejected', input, result: null, errors, calibration };
   }
   try {
-    const result: RecordResultPayload = input.kind === 'fault' ? computeFault(input) : computeTransform(input);
-    return { status: 'ok', input, result, errors: [] };
+    // 同一批次的正变换/反变换/故障核算共用这一个标定引擎实例
+    const engine = new CalibratedEngine(calibration);
+    const result: RecordResultPayload = input.kind === 'fault'
+      ? computeFault(input, engine)
+      : computeTransform(input, engine);
+    return { status: 'ok', input, result, errors: [], calibration };
   } catch (err) {
     return {
       status: 'rejected',
       input,
       result: null,
       errors: [{ code: 'VALIDATION_FAILED', field: '$', message: `计算失败: ${(err as Error).message}` }],
+      calibration,
     };
   }
 }
