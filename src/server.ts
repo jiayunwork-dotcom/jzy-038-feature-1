@@ -16,7 +16,7 @@ async function main(): Promise<void> {
     repo = new InMemoryBatchRepository();
   }
 
-  const app = await buildApp(repo);
+  const app = await buildApp(repo, { defaultCalibration: config.defaultCalibration });
   await app.listen({ port: config.port, host: config.host });
   app.log.info(`symcomp service listening on ${config.host}:${config.port} (storage=${config.storage})`);
 }

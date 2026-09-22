@@ -148,4 +148,65 @@ assert(bulk.status === 200 && bulk.json.count === 2
   && bulk.json.records[0].status === 'ok' && bulk.json.records[1].status === 'rejected',
   '批量提交：合法与非法记录各自独立留存');
 
+// 10) 批次标定：开立冻结、正负序对调、偏移正反闭合、非法开立拒绝、冻结后修改拒绝
+const fwdBatch = (await call('POST', '/batches', { calibration: { direction: 'forward', referenceAngleOffsetDeg: 0 } })).json;
+assert(fwdBatch.calibration.direction === 'forward' && fwdBatch.calibration.referenceAngleOffsetDeg === 0, '批次开立时标定冻结并随批次返回');
+const revBatch = (await call('POST', '/batches', { calibration: { direction: 'reverse', referenceAngleOffsetDeg: 0 } })).json;
+
+const sameInput = { a: { magnitude: 12.5, angleDeg: 20 }, b: { magnitude: 8.1, angleDeg: -95 }, c: { magnitude: 15.3, angleDeg: 140 } };
+const sf = (await call('POST', `/batches/${fwdBatch.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sameInput,
+})).json.result.sequence;
+const sr = (await call('POST', `/batches/${revBatch.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sameInput,
+})).json.result.sequence;
+assert(close(sr.positive.magnitude, sf.negative.magnitude, 1e-8)
+  && close(sr.negative.magnitude, sf.positive.magnitude, 1e-8)
+  && close(sr.zero.magnitude, sf.zero.magnitude, 1e-8),
+  '正向/反向批次：正序负序正好互换，零序不受方向标定影响');
+
+// 带偏移批次：正变换 -> 同批反变换，精确回到原始三相（多偏移、正反两方向）
+for (const [direction, offset] of [['forward', 25], ['forward', -138.2], ['reverse', 25], ['reverse', 300]]) {
+  const b = (await call('POST', '/batches', { calibration: { direction, referenceAngleOffsetDeg: offset } })).json;
+  const f = (await call('POST', `/batches/${b.id}/records`, {
+    kind: 'transform', quantity: 'voltage', direction: 'phase->sequence', phases: sameInput,
+  })).json;
+  assert(f.calibration.direction === direction && f.calibration.referenceAngleOffsetDeg === offset, '每条记录冗余批次标定快照');
+  const i = (await call('POST', `/batches/${b.id}/records`, {
+    kind: 'transform', quantity: 'voltage', direction: 'sequence->phase', sequence: f.result.sequence,
+  })).json.result.phases;
+  const okRt = ['a', 'b', 'c'].every((k) => close(i[k].magnitude, sameInput[k].magnitude, 1e-7) && close(i[k].angleDeg, sameInput[k].angleDeg, 1e-6));
+  assert(okRt, `标定 ${direction}/${offset}° 正反变换闭合回到原始三相`);
+}
+
+// 故障核算在标定批次里同样留痕且与变换模块标定一致（序电压反变换回 A 相 = 故障相电压）
+const faultBatch = (await call('POST', '/batches', { calibration: { direction: 'reverse', referenceAngleOffsetDeg: 62.5 } })).json;
+const fr = (await call('POST', `/batches/${faultBatch.id}/records`, {
+  kind: 'fault', z1: { magnitude: 1, angleDeg: 80 }, z2: { magnitude: 1.2, angleDeg: 78 },
+  z0: { magnitude: 2, angleDeg: 75 }, vf: { magnitude: 1, angleDeg: 20 }, rf: 0.1,
+})).json;
+assert(fr.status === 'ok' && fr.calibration.direction === 'reverse' && fr.calibration.referenceAngleOffsetDeg === 62.5,
+  '故障记录带批次标定快照');
+const fva = (await call('POST', `/batches/${faultBatch.id}/records`, {
+  kind: 'transform', quantity: 'voltage', direction: 'sequence->phase', sequence: fr.result.sequenceVoltages,
+})).json.result.phases.a;
+assert(close(fva.magnitude, fr.result.faultedPhaseVoltage.magnitude, 1e-7)
+  && close(fva.angleDeg, fr.result.faultedPhaseVoltage.angleDeg, 1e-6),
+  '故障模块与变换模块标定换算一致：序电压反变换 A 相 = 故障相电压');
+
+// 非法偏移：开立阶段结构化 400 拒绝，不产生批次
+for (const bad of [Infinity, -Infinity, '30', null]) {
+  const r = await call('POST', '/batches', { calibration: { referenceAngleOffsetDeg: bad } });
+  assert(r.status === 400 && r.json.error.code === 'CALIBRATION_OFFSET_NOT_FINITE',
+    `非法偏移 ${String(bad)} 开立即拒绝（不产生批次）`);
+}
+const badDir = await call('POST', '/batches', { calibration: { direction: 'sideways' } });
+assert(badDir.status === 400 && badDir.json.error.code === 'CALIBRATION_INVALID', '非法方向 400 结构化拒绝');
+
+// 已开立批次修改标定：409 CALIBRATION_FROZEN
+const frozen = await call('PATCH', `/batches/${fwdBatch.id}`, { calibration: { direction: 'reverse', referenceAngleOffsetDeg: 0 } });
+assert(frozen.status === 409 && frozen.json.error.code === 'CALIBRATION_FROZEN', '冻结后修改标定被明确拒绝（409）');
+const still = (await call('GET', `/batches/${fwdBatch.id}`)).json;
+assert(still.calibration.direction === 'forward' && still.calibration.referenceAngleOffsetDeg === 0, '被拒后批次标定保持不变');
+
 console.log(process.exitCode ? '\nSMOKE FAILED' : '\nALL SMOKE CHECKS PASSED');

@@ -40,6 +40,23 @@ Vc = V0 + a·V1  + a²·V2
 
 约定：正序相序为 A∠0°、B∠-120°、C∠+120°；把 B、C 对调即转为负序。电压电流用同一套定义，没有共轭分支。
 
+### 批次标定（相序方向 + 基准相角偏移）
+
+不同变电站、不同厂商的二次设备对"哪个是正序"以及零度参考点的标定习惯不一致。本服务把标定从内部唯一写死的默认值，提升为**开立批次时挑选、开立后冻结**的批次级配置：
+
+- `direction`：相序方向。
+  - `forward`（默认）：沿用上面的服务约定；
+  - `reverse`：调用方把正、负序对调标定（等价于 B、C 两相互换角色）。同组三相在 forward / reverse 两个批次下正变换的 V1、V2 **正好互换**，V0 不受影响。
+- `referenceAngleOffsetDeg`：基准相角偏移 δ（度，任意有限角度）。该批数据的零度参考轴相对服务默认零度轴转过 δ；换算时先在内部把输入归正（+δ）再进数学内核，输出再换回调用方参考系（−δ）。纯参考系平移对换算是不变量——调用方不需要在服务外手动搬角度；δ 的价值在于统一归正口径、随批次留痕、可追溯。
+
+实现要点（避免"只套一层壁纸"）：
+
+- 正变换、反变换、故障核算**共用 `src/calibration.ts` 中唯一的一组互逆原语**进出内核，数学内核本身不感知标定；
+- 方向对调的配对矩阵为正变换 `P·M`、反变换 `S·P`（P 为 V1/V2 换名，M/S 为内核正/反变换），二者乘积为 I —— 任意三相在同一批次内先正再反（或先反再正），在 `1e-9` 容差内精确还原，与方向、偏移无关；
+- 故障假定落在 A 相（B/C 换名的不动点），因此方向标定对故障结果无数值影响，但**偏移角与变换记录走同一套归正/换回**，故障模块不会只认默认零度；
+- 标定在**批次开立时快照冻结**：批次与每条记录（含被拒绝记录）都持久化标定快照，看任意一条记录即可知当时用的哪套标定；之后即使服务默认标定改变，已开批次不受影响；
+- 升级前建立的旧批次/旧记录没有标定信息，读出时一律认定为服务当初唯一支持的默认标定（forward / 0），数据库迁移会把该默认值显式回填旧行；零偏移/正向走恒等快通道，旧批次新老结果**逐位一致**，升级不是隐性破坏性变更。
+
 ### 单相接地故障（故障落在 A 相）
 
 三序网络串联，序电流相等：
@@ -60,14 +77,42 @@ I1 = I2 = I0 = Vf / (Z1 + Z2 + Z0 + 3·Rf)
 
 | 方法 | 路径 | 说明 |
 | ---- | ---- | ---- |
-| POST | `/batches` | 开立批次 |
+| POST | `/batches` | 开立批次（可携带 `calibration`，缺省用服务默认标定） |
+| PATCH/PUT | `/batches/:id` | 批次标定为冻结项：任何标定修改一律 409 拒绝 |
 | POST | `/batches/:id/records` | 投入一条（对象）或多条（数组）记录 |
 | GET  | `/batches/:id` | 查批次（含全部记录） |
 | GET  | `/batches/:id/records` | 取批次内全部记录 |
 | GET  | `/batches/:id/records/:rid` | 只取一条记录 |
 | GET  | `/health` | 健康检查 |
 
-每条记录都留存：原始输入、输出结果、变换方向、状态（`ok`/`rejected`）与结构化错误。**校验不过的记录也入库**（单条投递返回 422，批量投递返回 200、逐条标状态），不会被悄悄丢弃。
+每条记录都留存：原始输入、输出结果、变换方向、状态（`ok`/`rejected`）、结构化错误以及**本批次冻结的标定快照**。**校验不过的记录也入库**（单条投递返回 422，批量投递返回 200、逐条标状态），不会被悄悄丢弃。
+
+### 开立批次与标定
+
+```bash
+# 不指定标定：快照服务默认（环境变量未配置时即 forward / 0，与历史行为一致）
+curl -s -X POST localhost:8080/batches -H 'content-type: application/json' -d '{"note":"demo"}'
+
+# 指定反向标定 + 30° 基准偏移
+curl -s -X POST localhost:8080/batches -H 'content-type: application/json' -d '{
+  "note": "substation-X reverse wired",
+  "calibration": { "direction": "reverse", "referenceAngleOffsetDeg": 30 }
+}'
+# -> {"id":"<BATCH_ID>", "calibration":{"direction":"reverse","referenceAngleOffsetDeg":30}, ...}
+```
+
+`calibration` 字段可整体省略（用默认），也可只给其中一项（另一项回落默认）。开立后该标定**冻结**：
+
+```bash
+curl -s -X PATCH localhost:8080/batches/<BATCH_ID> -H 'content-type: application/json' \
+  -d '{"calibration":{"direction":"forward","referenceAngleOffsetDeg":0}}'
+# -> 409 {"error":{"code":"CALIBRATION_FROZEN", ...}}
+```
+
+非法标定在开立阶段即被结构化拒绝（`400`），不产生批次：偏移为 `NaN`/`Infinity`/字符串/`null` → `CALIBRATION_OFFSET_NOT_FINITE`；方向非 `forward`/`reverse`、标定整体非对象 → `CALIBRATION_INVALID`。
+
+服务默认标定可由环境变量覆盖（仅影响之后新开、且未显式指定标定的批次，不追溯旧批次）：
+`DEFAULT_SEQUENCE_DIRECTION`（`forward`/`reverse`）、`DEFAULT_REFERENCE_ANGLE_OFFSET_DEG`（有限数值）。
 
 ### 正变换（三相 → 序）
 
@@ -141,7 +186,7 @@ curl -s -X POST localhost:8080/batches/<BATCH_ID>/records \
 }
 ```
 
-错误类型：`MAGNITUDE_NON_POSITIVE` / `MISSING_PHASE` / `ANGLE_NOT_FINITE` / `MALFORMED_PHASOR` / `IMPEDANCE_NON_POSITIVE` / `FAULT_IMPEDANCE_NON_POSITIVE` / `LINE_ZERO_SEQUENCE_NOT_ZERO` / `LINE_MODE_NOT_APPLICABLE_TO_CURRENT` / `BATCH_NOT_FOUND` / `RECORD_NOT_FOUND` / `VALIDATION_FAILED` / `UNSUPPORTED_RECORD`。
+错误类型：`MAGNITUDE_NON_POSITIVE` / `MISSING_PHASE` / `ANGLE_NOT_FINITE` / `MALFORMED_PHASOR` / `IMPEDANCE_NON_POSITIVE` / `FAULT_IMPEDANCE_NON_POSITIVE` / `LINE_ZERO_SEQUENCE_NOT_ZERO` / `LINE_MODE_NOT_APPLICABLE_TO_CURRENT` / `CALIBRATION_INVALID` / `CALIBRATION_OFFSET_NOT_FINITE` / `CALIBRATION_FROZEN` / `BATCH_NOT_FOUND` / `RECORD_NOT_FOUND` / `VALIDATION_FAILED` / `UNSUPPORTED_RECORD`。
 
 ---
 
@@ -149,11 +194,20 @@ curl -s -X POST localhost:8080/batches/<BATCH_ID>/records \
 
 ```bash
 npm ci
-npm test          # vitest，51 个用例（内核 + 校验 + HTTP + 并发）
+npm test          # vitest，内核 + 校验 + 标定 + HTTP + 并发
 npm run build     # tsc -> dist/
 npm start         # 默认内存存储，:8080
 STORAGE=postgres DATABASE_URL=postgres://symcomp:symcomp@localhost:5432/symcomp npm start
 ```
+
+测试覆盖的标定关系：
+
+- **标定正反闭合**：随机三相/随机序量，在 forward/reverse × 多个偏移角（含负角、超大角）的组合下双向闭合到机器精度；
+- **方向对调**：同组三相 forward / reverse 两批次 V1、V2 互换、V0 相同；平衡正序在反向批次被认定为纯负序；
+- **跨模块一致**：故障批次的序网电压/序电流经同批次反变换，A 相分别等于故障相电压/故障相电流；方向标定不改变 A 相故障结果；
+- **旧数据兼容**：持久化层对标定列 NULL/缺省的旧行一律补成历史默认标定；恒等标定走快通道，旧批次重算逐位一致；
+- **合法性把关**：偏移 NaN/Infinity/非数字、方向非法、标定非对象在开立阶段 400 拒绝且不产生批次；已开立批次 PATCH/PUT 标定返回 409 `CALIBRATION_FROZEN` 且原值不变；
+- **冻结与留痕**：记录级私带标定字段被忽略；ok / rejected 记录都带批次冻结标定快照。
 
 测试覆盖的物理关系：
 
@@ -178,29 +232,30 @@ docker compose up --build
 - `db`：PostgreSQL 16（持久化卷 `pgdata`，带健康检查）；
 - `api`：本服务，等数据库健康后启动，自动执行建表迁移，映射到宿主机 `8080`。
 
-环境变量：`STORAGE`（`postgres`/`memory`）、`DATABASE_URL`、`PORT`、`HOST`。
+环境变量：`STORAGE`（`postgres`/`memory`）、`DATABASE_URL`、`PORT`、`HOST`、`DEFAULT_SEQUENCE_DIRECTION`（`forward`/`reverse`）、`DEFAULT_REFERENCE_ANGLE_OFFSET_DEG`（默认标定偏移，有限数值）。后两者只在新开批次未显式指定标定时生效。
 
 ## 5. 模块结构（按职责拆分）
 
 ```
 src/
   complex.ts              复数运算 + 旋转算子 a（唯一一份）
+  calibration.ts          批次标定：开立校验/冻结快照 + 参考系互逆原语（唯一一份）
   types.ts                对外/对内数据模型与错误类型
   validation.ts           带类型的输入校验
-  records.ts              记录处理引擎（校验 -> 内核 -> 留存记录）
+  records.ts              记录处理引擎（校验 -> 标定归正 -> 内核 -> 标定换回 -> 留存）
   app.ts                  Fastify 装配与统一错误处理
   server.ts               入口与存储选择
-  config.ts               环境配置
+  config.ts               环境配置（含服务默认标定）
   kernel/
-    transform.ts          正反变换内核（合成矩阵 + 其逆）
-    fault.ts              单相接地序网核算内核
+    transform.ts          正反变换内核（合成矩阵 + 其逆，不感知标定）
+    fault.ts              单相接地序网核算内核（不感知标定）
   routes/
-    records.ts            HTTP 路由（批次/记录）
+    records.ts            HTTP 路由（批次开立/标定冻结/记录）
   persistence/
     repository.ts         仓储接口
     memory.ts             内存实现（测试/默认）
-    postgres.ts           PostgreSQL 实现
-  db/migrate.ts           建表迁移（幂等）
+    postgres.ts           PostgreSQL 实现（旧行标定缺省自动补齐）
+  db/migrate.ts           建表与标定列增量迁移（幂等）
 tests/                    vitest 自动化测试
 ```
 
